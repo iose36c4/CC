@@ -1,0 +1,317 @@
+-- Sistema de Gestión de Usuarios y RBAC (esqueleto técnico para CLI)
+-- Plataforma: CC: Tweaked / CraftOS 1.9
+-- REGLA: Este archivo contiene exclusivamente comentarios Lua (--) que
+-- describen la gramática de la CLI, firmas de funciones, parámetros y flujo lógico.
+
+-- =============================================================
+-- I. Gramática de la CLI (Sujeto + Verbo)
+-- =============================================================
+-- Convención: `<sujeto> <verbo> [args] [flags]`
+-- - Sujetos: `user`, `role`, `session`, `audit`, `config`, `system`
+-- - Verbos: `add|create`, `get|show|status|list`, `update|modify|edit`, `delete|rm`,
+--           `assign`, `revoke`, `login`, `logout`, `help`
+-- Comandos y ejemplos:
+-- - `user add <id> [--role R] [--meta '{"name":"Ana"}']`  -- crear usuario
+-- - `user list [--json] [--limit N]`                         -- listar usuarios
+-- - `user show <id>`                                         -- mostrar usuario
+-- - `role create <id> --permissions '<json>'`               -- crear rol
+-- - `role list`                                              -- listar roles
+-- - `session status [--json]`                                -- estado de sesión
+-- - `audit tail --lines N`                                   -- ver últimas N entradas
+-- Flags comunes y semántica:
+-- - `-h`, `--help`   : mostrar ayuda contextual
+-- - `-v`, `--version`: mostrar versión del sistema
+-- - `-f`, `--force`  : aplicar acciones destructivas sin prompt interactivo
+-- - `--json`         : salida en JSON para máquinas
+-- - `--pretty`       : salida JSON con indentación legible
+-- - `--limit`, `--page`: paginación
+-- Parser y comportamiento:
+-- - El parser debe extraer `sujeto` y `verbo` primero, luego parsear args y flags.
+-- - Si no se especifica `verbo`, mostrar la ayuda del sujeto.
+-- - `--help` siempre gana: mostrar ayuda y salir con código 0.
+-- - Validar flags; parámetros inválidos retornan código 1 y mensaje de uso.
+-- Ayuda por defecto:
+-- - function cliHelp(subject_opt:string|nil) -> void
+--   - Si `subject_opt` es nil: mostrar resumen de usuarios, roles, sesiones y ejemplos.
+--   - Si se suministra `subject_opt`, mostrar verbos soportados, flags y ejemplos concretos.
+-- Códigos de salida estandarizados:
+-- - 0 = éxito
+-- - 1 = uso inválido / argumentos
+-- - 2 = no autorizado
+-- - 3 = no encontrado
+-- - 4 = conflicto (p.ej. ya existe)
+-- - 5 = error interno / I/O
+
+-- =============================================================
+-- II. Seguridad y Control de Inicio (startup.lua)
+-- =============================================================
+-- Objetivo: startup toma control y obliga a pasar por login; bloquear Ctrl+T.
+-- startup.lua (responsabilidades):
+-- - function mainStartup():
+--   - initEnvironment()  -- crear `/hdd/db/` y subdirs si faltan
+--   - cargar CONFIG_DIR
+--   - auditLog('server_start', { ts = now_iso() })
+--   - entrar en loop principal de eventos
+-- - Bucle principal (esquema):
+--   - while running do
+--       local ev = os.pullEventRaw()
+--       if ev == 'terminate' then
+--         -- NO permitir salida por Ctrl+T: registrar intento y continuar
+--         auditLog('terminate_attempt', { user = current_user_or_nil(), ts = now_iso() })
+--       else
+--         -- dispatch de eventos: modem, timer, tty, etc.
+--       end
+--     end
+-- - Salida permitida solo vía `system shutdown` autenticado por credenciales con permiso.
+-- Captura de credenciales (CLI interactiva):
+-- - function captureCredentials(prompt_user:string, prompt_pass:string) -> (user:string, pass:string)
+--   - Mostrar prompt de usuario y usar `read('*')` para enmascarar la contraseña/PIN.
+--   - No mantener la contraseña en memoria más tiempo del estrictamente necesario.
+-- - function loginFlow(max_attempts:int, lockout_seconds:int) -> (session_id|string|nil, err:string)
+--   - Contador de intentos, bloqueo temporal, registro de intentos en auditoría.
+
+-- =============================================================
+-- III. Persistencia y Sintaxis JSON (ACOS: /hdd/db/)
+-- =============================================================
+-- Reglas de almacenamiento:
+-- - DB_ROOT = '/hdd/db/'
+-- - USERS_DIR = DB_ROOT .. 'users/'      -- /hdd/db/users/<id>.json
+-- - ROLES_DIR = DB_ROOT .. 'roles/'      -- /hdd/db/roles/<id>.json
+-- - SESSIONS_DIR = DB_ROOT .. 'sessions/'
+-- - LOGS_DIR = DB_ROOT .. 'logs/'
+-- Forma y esquema JSON:
+-- - Siempre usar comillas dobles para claves y strings.
+-- - Soportar types: string, number, boolean, array, object, null.
+-- - Usuarios (ejemplo mínimo):
+--   {
+--     "id": "juan",
+--     "password_hash": "sha256:<salt>:<hex>",
+--     "roles": ["operador"],
+--     "meta": {"name":"Juan"},
+--     "status":"active",
+--     "created_at":"2026-02-04T...Z"
+--   }
+-- Escritura atómica (obligatoria):
+-- - Algoritmo recomendado en `fs_utils.writeJSONAtomic(path, tbl)`:
+--   1) Serializar objeto en memoria: `textutils.serializeJSON(tbl)` (opcional indent).
+--   2) Escribir a `path .. '.tmp'` (o `path .. '.' .. pid .. '.tmp'`).
+--   3) Llamar file:flush() si disponible y luego file:close().
+--   4) Mover el temporal a destino con `fs.move(temp, path)` (operación atómica esperada).
+--   5) Validar mediante relectura opcional para confirmar integridad.
+-- - En caso de fallo: intentar revertir o restaurar desde BACKUP_DIR.
+-- Lectura segura:
+-- - `readJSON(path)` debe abrir, leer, deserializar con textutils.unserializeJSON y cerrar
+--   con file.close() en todos los casos.
+
+-- =============================================================
+-- IV. Motor RBAC y Autorización
+-- =============================================================
+-- Objetivo: resolver permisos con herencia y scope 'propio'.
+-- Firmas principales:
+-- - function resolveEffectivePermissions(roles_list:[string]) -> [permission]
+--   - Cargar roles desde ROLES_DIR, resolver herencia recursiva y eliminar duplicados.
+--   - Detectar y rechazar ciclos en la herencia.
+-- - function denyAccess(user_id:string, operacion:string, objeto:string, recurso_id_opt:string|nil, session_opt:table|nil) -> (denied:boolean, reason:string|null)
+--   - Pasos detallados:
+--     1) Identificar role activo: usar session_opt.active_role o la session actual.
+--     2) Cargar roles del usuario desde USERS_DIR/<user_id>.json.
+--     3) Calcular permisos efectivos con resolveEffectivePermissions().
+--     4) Evaluar matching entre permiso y (objeto, operacion):
+--        - Empate si permiso.obj == objeto OR permiso.obj == '*' OR permiso.obj es prefijo.
+--        - Operación coincide si permiso.op == operacion OR permiso.op == '*'.
+--     5) Evaluar scope:
+--        - scope == 'global' => permiso aplica.
+--        - scope == 'propio' => cargar recurso (metadatos) y comprobar recurso.owner == user_id.
+--          * Si recurso_id_opt es nil, interpretar según contexto o denegar por defecto.
+--     6) Política de resolución: default = deny; allow solo si al menos un permiso válido aplica.
+--     7) Devolver (false, nil) si permitido; (true, "razón") si denegado.
+-- - function hasPermission(...) -> boolean : wrapper que devuelve not denyAccess(...).
+-- Notas:
+-- - Registrar en auditoría accesos denegados con detalles para análisis forense.
+-- - Evitar wildcards demasiado permisivos; documentar ejemplos de patrones seguros.
+
+-- =============================================================
+-- V. Salida (humana) y --json (máquina)
+-- =============================================================
+-- Salida humana (por defecto):
+-- - Tabular, columnas alineadas, ancho adaptativo; truncar con '...' cuando haga falta.
+-- - Implementar renderTable(rows, columns) para consistencia.
+-- Salida máquina: `--json` devuelve un JSON único en stdout.
+-- - En caso de error, salida JSON debe contener { "ok": false, "error": "mensaje", "code": N }.
+-- - Siempre acompañar con exit code != 0 en caso de error.
+
+-- =============================================================
+-- VI. Auditoría FIFO limitada a 1000 entradas
+-- =============================================================
+-- Contrato `auditLog(event_type:string, details:table) -> void`:
+-- - Construir entrada: { "ts": ISO8601, "event_type":..., "session_id":..., "user_id":..., "details": details }
+-- - Persistir en LOGS_DIR .. 'audit.log' como JSON-lines (una entrada por línea).
+-- Límite MAX_LOG_ENTRIES = 1000:
+-- - Al insertar:
+--   1) Determinar num_entries actuales (p.ej. audit.idx o conteo de líneas).
+--   2) Si num_entries >= MAX_LOG_ENTRIES:
+--      - Eliminar las entradas más antiguas suficientes para liberar espacio (mantener MAX_LOG_ENTRIES-1)
+--      - Reescribir el archivo de logs atómicamente con writeJSONAtomic si es necesario.
+--   3) Añadir la nueva entrada (append atómico preferible).
+-- - En entornos con I/O limitado: usar estrategia de archivos rotativos por bloques para eficiencia.
+
+-- =============================================================
+-- VII. Integridad, backups y consideraciones operativas
+-- =============================================================
+-- - Validar y sanitizar identificadores antes de mapear a rutas de archivo.
+-- - Tras cambios críticos, crear snapshot incremental en BACKUP_DIR con checksum.
+-- - Proveer scripts de restauración que validen integridad antes de sobrescribir.
+
+-- =============================================================
+-- VIII. Entregables y modularidad
+-- =============================================================
+-- - Documentar e implementar los módulos (solo comentarios en esta fase):
+--   * modules/fs_utils.lua   -- readJSON, writeJSONAtomic, helpers I/O
+--   * modules/hash.lua       -- hashPassword, verifyPassword
+--   * modules/auth.lua       -- captureCredentials, loginFlow
+--   * modules/rbac.lua       -- resolveEffectivePermissions, denyAccess, hasPermission
+--   * modules/ui_cli.lua     -- parser CLI, renderTable, cliHelp
+--   * modules/audit.lua      -- auditLog, rotation FIFO
+-- - Cada comando debe devolver código de salida 0 en éxito y >0 en error.
+
+-- Fin del esqueleto CLI y RBAC (solo comentarios). Implementar según estas firmas
+-- y validar con pruebas unitarias antes de desplegar en producción CC: Tweaked.
+-- 6.1) Contrato de `auditLog(event_type:string, details:table) -> void`:
+
+-- =============================================================
+-- IX. Comandos requeridos, flags y códigos de salida (especificación precisa)
+-- =============================================================
+-- Comandos obligatorios:
+-- - `user <add|list|show|delete|edit>`
+-- - `role <create|list|assign|revoke>`
+-- - `session <status|login|logout>`
+-- - `audit <tail|clear>`
+-- - `system <shutdown|help>`
+-- Flags estándar:
+-- - `-h`, `--help` : mostrar ayuda (contextual por sujeto/verb)
+-- - `--json`      : salida en JSON para máquinas
+-- - `-f`, `--force`: ejecutar acciones destructivas sin confirmación interactiva
+-- - `--pretty`    : salida JSON con indentación legible
+-- - `--limit N`, `--page N` : paginación para listados
+-- Comportamiento de la CLI:
+-- - Parsear y validar `sujeto` y `verbo` primero, luego argumentos y flags.
+-- - Si no hay verbo válido: mostrar ayuda del sujeto y salir con código 1.
+-- - `--help` tiene prioridad y debe causar salida con código 0.
+-- Códigos de salida requeridos (normalizados):
+-- - `0` = éxito
+-- - `1` = uso inválido / argumentos
+-- - `2` = no autorizado
+-- - `3` = no encontrado
+-- - `5` = error I/O o fallo interno
+
+-- =============================================================
+-- X. `startup.lua` comportamiento crítico y manejo de terminate
+-- =============================================================
+-- - `startup.lua` debe tomar control total del equipo al arrancar.
+-- - `mainStartup()` responsabilidades:
+--   * Llamar a `initEnvironment()` para crear `/hdd/db/` y subdirectorios.
+--   * Cargar configuración y políticas desde `CONFIG_DIR`.
+--   * Registrar `server_start` en auditoría.
+--   * Iniciar bucle principal con `os.pullEventRaw()` y dispatch de eventos.
+-- - Manejo de `terminate` (Ctrl+T):
+--   * El bucle debe interceptar el evento `terminate` y NO terminar el proceso.
+--   * Cada `terminate` recibido se registra con `auditLog('terminate_attempt', {...})`.
+--   * La única vía para apagar: `system shutdown` autenticado con permisos adecuados.
+
+-- =============================================================
+-- XI. Persistencia JSON y algoritmo de escritura atómica (detallado)
+-- =============================================================
+-- - Cada entidad persistente es un fichero JSON individual bajo `/hdd/db/`.
+--   * Usuarios: `/hdd/db/users/<id>.json`
+--   * Roles: `/hdd/db/roles/<id>.json`
+-- - Reglas sintácticas estrictas:
+--   * Usar comillas dobles para claves y strings (ej. "id": "juan").
+--   * Soportar tipos JSON estándar: string, number, boolean, array, object, null.
+-- - `fs_utils.writeJSONAtomic(path, tbl)` (algoritmo exacto):
+--   1) Serializar `tbl` en memoria con `textutils.serializeJSON(tbl)` (opcional indent).
+--   2) Abrir `path_tmp = path .. '.tmp'` para escritura.
+--   3) Escribir el contenido serializado, llamar `file:flush()` si está disponible.
+--   4) Llamar `file:close()` inmediatamente para liberar el handle.
+--   5) Mover el temporal al destino con `fs.move(path_tmp, path)`.
+--   6) Opcional: reabrir y `textutils.unserializeJSON` para validar integridad; si falla,
+--      registrar error y revertir si es posible.
+-- - En caso de fallo en `fs.move`, intentar restaurar desde `BACKUP_DIR` y retornar error.
+
+-- =============================================================
+-- XII. Motor RBAC: resolución de permisos y detección de ciclos
+-- =============================================================
+-- - `resolveEffectivePermissions(roles_list)` debe:
+--   * Cargar cada rol desde `ROLES_DIR`.
+--   * Construir un grafo de herencia donde cada nodo es un rol y aristas apuntan a `inherits`.
+--   * Detectar ciclos usando DFS con marca de visitado (white/grey/black) y rechazar configuraciones cíclicas.
+--   * Realizar topological sort para ordenar roles padre antes de hijos.
+--   * Acumular permisos en orden (padres primero), eliminando duplicados y preservando scope y especificidad.
+-- - Consideraciones de conflicto:
+--   * Permisos más específicos (ej. objeto concreto) deben prevalecer sobre comodines.
+--   * Política por defecto: deny (fail-closed).
+
+-- =============================================================
+-- XIII. denyAccess() — lógica completa y retorno
+-- =============================================================
+-- - Firma: `denyAccess(user_id, operacion, objeto, recurso_id_opt, session_opt) -> (denied:boolean, reason:string|null)`
+-- - Flujo detallado:
+--   1) Determinar role activo: `session_opt.active_role` si existe, sino cargar la sesión actual.
+--   2) Leer `USERS_DIR/<user_id>.json` para obtener la lista de roles del usuario.
+--   3) Llamar `resolveEffectivePermissions(roles_list)` para obtener `permissions_effective`.
+--   4) Filtrar `permissions_effective` por coincidencia con `objeto` y `operacion`:
+--      - Coincide si `perm.obj == objeto` OR `perm.obj == '*'` OR `perm.obj` es prefijo válido.
+--      - Coincide operación si `perm.op == operacion` OR `perm.op == '*'`.
+--   5) Para cada permiso coincidente evaluar `scope`:
+--      - Si `scope == 'global'` entonces el permiso es candidato válido.
+--      - Si `scope == 'propio'` (SOLOLASPROPIAS):
+--         * Si `recurso_id_opt` no se proporciona -> considerar contexto; por defecto DENEGAR.
+--         * Si se proporciona, cargar metadatos del recurso (p.ej. desde un almacén de recursos)
+--           y comprobar `recurso.owner == user_id`.
+--         * Si no coincide o owner ausente -> ese permiso no autoriza.
+--   6) Resolución final:
+--      - Si existe permiso explícito de tipo 'deny' aplicable -> devolver (true, 'deny: ...').
+--      - Si existe al menos un permiso 'allow' aplicable -> devolver (false, nil).
+--      - Si no hay permisos aplicables -> devolver (true, 'no matching permissions').
+-- - Notas: registrar accesos denegados en auditoría con `auditLog('access_denied', {...})`.
+
+-- =============================================================
+-- XIV. Auditoría FIFO (1000 entradas) — eliminación de la más antigua
+-- =============================================================
+-- - Implementar `MAX_LOG_ENTRIES = 1000` constante.
+-- - Al insertar nueva entrada en `LOGS_DIR .. 'audit.log'`:
+--   1) Determinar el número actual de entradas (mantener `audit.idx` con contador o contar líneas).
+--   2) Si `count >= MAX_LOG_ENTRIES`:
+--      - Eliminar exactamente `count - (MAX_LOG_ENTRIES - 1)` entradas más antiguas
+--        dejando espacio para la nueva (es decir mantener MAX_LOG_ENTRIES-1 antes de append).
+--      - Implementación práctica: leer archivo, extraer las últimas (MAX_LOG_ENTRIES-1) líneas,
+--        reescribir el archivo atómicamente y luego append la nueva entrada.
+--   3) Append de la nueva entrada (preferible append atómico si el FS lo soporta).
+-- - Garantizar atomicidad y consistencia incluso si el sistema se apaga durante la operación.
+
+-- =============================================================
+-- XV. Salida tabular y --json
+-- =============================================================
+-- - Por defecto, `ui_cli` debe renderizar tablas legibles:
+--   * `renderTable(rows, columns)` => alinear columnas, ajustar ancho y truncar con '...'.
+-- - Si `--json` presente, retornar estructura JSON válida y usar exit codes apropiados.
+
+-- =============================================================
+-- XVI. Modularidad y `require`
+-- =============================================================
+-- - Organizar el código en módulos que puedan `require`:
+--   * `modules.fs_utils`  -- `readJSON`, `writeJSONAtomic`, `safeWriteLines`, helpers I/O
+--   * `modules.auth`      -- `captureCredentials`, `loginFlow`, `logoutFlow`
+--   * `modules.rbac`      -- `resolveEffectivePermissions`, `denyAccess`, `hasPermission`
+--   * `modules.ui_cli`    -- CLI parser, `renderTable`, `cliHelp`, salida `--json`
+--   * `modules.audit`     -- `auditLog`, `rotateAuditFIFO`, `auditIndex`
+-- - Ejemplo de carga: `local fs_utils = require('modules.fs_utils')` (en entorno CC: Tweaked)
+
+-- =============================================================
+-- XVII. Consideraciones finales para el implementador
+-- =============================================================
+-- - Documentar claramente los contratos de cada función (entradas, salidas, errores).
+-- - Implementar y ejecutar pruebas unitarias que simulen `fs` y `textutils`.
+-- - Evitar agregar lógica sensible fuera de los módulos; mantener separación de responsabilidades.
+-- - Antes del despliegue, realizar pruebas de fallo (apagar durante writeJSONAtomic) y
+--   validar la capacidad de recuperación desde `BACKUP_DIR`.
+
