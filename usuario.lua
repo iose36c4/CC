@@ -1,3 +1,168 @@
+local fs_utils = require("modules.fs_utils")
+local hash = require("modules.hash")
+local auth = require("modules.auth")
+local rbac = require("modules.rbac")
+local ui_cli = require("modules.ui_cli")
+local audit = require("modules.audit")
+
+--- =============================================================
+--- I. Gramática de la CLI (Sujeto + Verbo)
+--- =============================================================
+--- Convención: `<sujeto> <verbo> [args] [flags]`
+--- - Sujetos: `user`, `role`, `session`, `audit`, `config`, `system`
+--- - Verbos: `add|create`, `get|show|status|list`, `update|modify|edit`, `delete|rm`,
+---           `assign`, `revoke`, `login`, `logout`, `help`
+--- Comandos y ejemplos:
+--- - `user add <id> [--role R] [--meta '{"name":"Ana"}']`  -- crear usuario
+--- - `user list [--json] [--limit N]`                         -- listar usuarios
+--- - `user show <id>`                                         -- mostrar usuario
+--- - `role create <id> --permissions '<json>'`               -- crear rol
+--- - `role list`                                              -- listar roles
+--- - `session status [--json]`                                -- estado de sesión
+--- - `audit tail --lines N`                                   -- ver últimas N entradas
+--- Flags comunes y semántica:
+--- - `-h`, `--help`   : mostrar ayuda contextual
+--- - `-v`, `--version`: mostrar versión del sistema
+--- - `-f`, `--force`  : aplicar acciones destructivas sin prompt interactivo
+--- - `--json`         : salida en JSON para máquinas
+--- - `--pretty`       : salida JSON con indentación legible
+--- - `--limit`, `--page`: paginación
+--- Parser y comportamiento:
+--- - El parser debe extraer `sujeto` y `verbo` primero, luego parsear args y flags.
+--- - Si no se especifica `verbo`, mostrar la ayuda del sujeto.
+--- - `--help` siempre gana: mostrar ayuda y salir con código 0.
+--- - Validar flags; parámetros inválidos retornan código 1 y mensaje de uso.
+--- Ayuda por defecto:
+--- - function cliHelp(subject_opt:string|nil) -> void
+---   - Si `subject_opt` es nil: mostrar resumen de usuarios, roles, sesiones y ejemplos.
+---   - Si se suministra `subject_opt`, mostrar verbos soportados, flags y ejemplos concretos.
+--- Códigos de salida estandarizados:
+--- - 0 = éxito
+--- - 1 = uso inválido / argumentos
+--- - 2 = no autorizado
+--- - 3 = no encontrado
+--- - 4 = conflicto (p.ej. ya existe)
+--- - 5 = error interno / I/O
+
+local usuario = {}
+
+local DB_ROOT = "/hdd/db/"
+local USERS_DIR = DB_ROOT .. "users/"
+local ROLES_DIR = DB_ROOT .. "roles/"
+local SESSIONS_DIR = DB_ROOT .. "sessions/"
+local LOGS_DIR = DB_ROOT .. "logs/"
+
+local function nowISO()
+  return os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
+
+local function initEnvironment()
+  fs_utils.ensureTree({ DB_ROOT, USERS_DIR, ROLES_DIR, SESSIONS_DIR, LOGS_DIR })
+end
+
+local function sanitizeId(id)
+  if not id or id == "" then
+    return nil
+  end
+  if id:find("[^%w%-%_]") then
+    return nil
+  end
+  return id
+end
+
+local function parseNamedArgs(args)
+  local options = {}
+  local positionals = {}
+  local i = 1
+  while i <= #args do
+    local arg = args[i]
+    if arg == "--role" then
+      i = i + 1
+      options.role = args[i]
+    elseif arg == "--meta" then
+      i = i + 1
+      options.meta = args[i]
+    elseif arg == "--permissions" then
+      i = i + 1
+      options.permissions = args[i]
+    elseif arg == "--lines" then
+      i = i + 1
+      options.lines = tonumber(args[i])
+    elseif arg == "--password" then
+      i = i + 1
+      options.password = args[i]
+    else
+      table.insert(positionals, arg)
+    end
+    i = i + 1
+  end
+  return positionals, options
+end
+
+local function jsonOrPrint(flags, ok, payload, code)
+  if flags.json then
+    print(ui_cli.jsonResult(ok, payload, code))
+  else
+    if ok then
+      if type(payload) == "string" then
+        print(payload)
+      elseif payload then
+        print(textutils.serialize(payload))
+      end
+    else
+      print("Error: " .. tostring(payload))
+    end
+  end
+  return code
+end
+
+local function loadUser(user_id)
+  local path = USERS_DIR .. user_id .. ".json"
+  return fs_utils.readJSON(path)
+end
+
+local function saveUser(user)
+  local path = USERS_DIR .. user.id .. ".json"
+  return fs_utils.writeJSONAtomic(path, user, { verify = true })
+end
+
+local function loadRole(role_id)
+  local path = ROLES_DIR .. role_id .. ".json"
+  return fs_utils.readJSON(path)
+end
+
+local function saveRole(role)
+  local path = ROLES_DIR .. role.id .. ".json"
+  return fs_utils.writeJSONAtomic(path, role, { verify = true })
+end
+
+local function listEntities(dir)
+  if not fs.exists(dir) then
+    return {}
+  end
+  local items = {}
+  for _, name in ipairs(fs.list(dir)) do
+    if name:sub(-5) == ".json" then
+      table.insert(items, name:sub(1, -6))
+    end
+  end
+  table.sort(items)
+  return items
+end
+
+-- Exports (esqueleto):
+usuario.initEnvironment = initEnvironment
+usuario.nowISO = nowISO
+usuario.sanitizeId = sanitizeId
+usuario.parseNamedArgs = parseNamedArgs
+usuario.jsonOrPrint = jsonOrPrint
+usuario.loadUser = loadUser
+usuario.saveUser = saveUser
+usuario.loadRole = loadRole
+usuario.saveRole = saveRole
+usuario.listEntities = listEntities
+
+return usuario
 -- Sistema de Gestión de Usuarios y RBAC (esqueleto técnico para CLI)
 -- Plataforma: CC: Tweaked / CraftOS 1.9
 -- REGLA: Este archivo contiene exclusivamente comentarios Lua (--) que
